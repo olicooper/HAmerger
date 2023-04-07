@@ -329,6 +329,54 @@ using (var tempDb = dbFactory.OpenDbConnection("TempDb"))
     // 4. END
 
     // 5. TODO: (optionally) Copy the remaining/new data (that hasn't been recalculated and inserted already) from the new db to the old
+
+    ////var metaMatchesToCopy = metadataMatches.Where(x => !x.OldId.HasValue).ToList(); // todo: build a list of meta which is only in the new database
+    ////foreach (var match in metaMatchesToCopy)
+    ////{
+
+    ////}
+
+    //var newMetaRowStatisticIds = newMetaRows
+    //    .Select(x => x.StatisticId)
+    //    .ToList();
+
+    //if (newMetaRows.Count == 0) return;
+
+    //var metaRowsToCopy = oldDb.Select<StatisticMeta>()
+    //    .Where(x => !newMetaRowStatisticIds.Contains(x.StatisticId))
+    //    .OrderBy(x => x.Id)
+    //    .ToList();
+
+    //if (metaRowsToCopy.Count == 0) return;
+
+    //var metaRowIdsToCopy = metaRowsToCopy.Select(x => x.Id).ToList();
+
+    //var statisticRowsToCopy = oldDb.Select<Statistic>()
+    //    .Where(x => metaRowIdsToCopy.Contains(x.MetadataId))
+    //    .OrderBy(x => x.Id)
+    //    .ToList();
+
+    ////foreach (var row in statisticRowsToCopy)
+    ////{
+    ////    
+    ////}
+
+    //var statisticShortTermRowsToCopy = oldDb.Select<StatisticShortTerm>()
+    //    .Where(x => metaRowIdsToCopy.Contains(x.MetadataId))
+    //    .OrderBy(x => x.Id)
+    //    .ToList();
+
+    ////if (!DRY_RUN)
+    ////{
+    ////    using (var scope = new TransactionScope(TransactionScopeOption.RequiresNew))
+    ////    {
+    ////        newDb.InsertAll(metaRowsToCopy);
+    ////        newDb.InsertAll(statisticRowsToCopy);
+    ////        newDb.InsertAll(statisticShortTermRowsToCopy);
+    ///         scope.Complete();
+    ////    }
+    ////}
+
     // 5. END
 
     // 6. (optionally) Copy data back to the new database, syncronizing both databases.

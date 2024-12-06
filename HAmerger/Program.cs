@@ -43,6 +43,8 @@ bool COPY_TO_NEW_DB = false; // args.Any(x => x == "--copy-to-new-db");
 
 
 Console.WriteLine($"Starting data merge{(DRY_RUN ? " (dry run)" : string.Empty)}");
+Console.WriteLine($" - OLD DB path: {Path.GetFullPath(OLD_DB_CONNECTION_STRING)}");
+Console.WriteLine($" - NEW DB path: {Path.GetFullPath(NEW_DB_CONNECTION_STRING)}");
 var stopwatch = Stopwatch.StartNew();
 
 var dbFactory = new OrmLiteConnectionFactory(OLD_DB_CONNECTION_STRING, GetProvider(DB_TYPE));

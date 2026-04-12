@@ -404,6 +404,7 @@ public class StatisticMeta
     [Alias("source")] public string Source { get; set; } = "";
     [Alias("unit_of_measurement")] public string UnitOfMeasurement { get; set; } = "";
     [Alias("name")] public string Name { get; set; } = "";
+    [Alias("mean_type")] public short MeanType { get; set; }
     [Alias("has_mean")] public bool HasMean { get; set; }
     [Alias("has_sum")] public bool HasSum { get; set; }
 }

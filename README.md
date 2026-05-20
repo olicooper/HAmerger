@@ -1,10 +1,10 @@
 # Home Assistant Database Merge Tool
 
-A cross-platform tool to merge the statistic tables in the database created by Home Assistant. This tool should be able to support `Sqlite`, `MySql` and `SqlServer` (although I've only tested Sqlite). Built on .NET7 (cross-platform compatible), using OrmLite to manipulate the databases.
+A cross-platform tool to merge the statistic tables in the database created by Home Assistant. This tool should be able to support `Sqlite`, `MySql` and `SqlServer` (although I've only tested Sqlite). Built on .NET10 (cross-platform compatible), using OrmLite to manipulate the databases.
 
 If you want to get started quickly, simply:
 
-* Open the project in Visual Studio 2022 
+* Open the project in Visual Studio 2026 or Visual Studio Code (with the `.NET Install Tool` extension)
 * Build the project (`Ctrl + Shift + B`)
 * Locate the build folder within the project folder `bin/`, create a folder called `data` and place your old and new database files in the folder (naming them `old.db` and `new.db`).
 * Run the program and wait for the data to be migrated.

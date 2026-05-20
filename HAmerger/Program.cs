@@ -3,6 +3,7 @@ using ServiceStack;
 using ServiceStack.DataAnnotations;
 using ServiceStack.OrmLite;
 using ServiceStack.Text;
+using System.Data;
 using System.Diagnostics;
 using System.Transactions;
 
@@ -26,36 +27,108 @@ static IOrmLiteDialectProvider GetProvider(DatabaseType type) => type switch
 // Select your database type here. Options are Sqlite, MySql, SqlServer
 // Be sure to update the connection strings below too!
 DatabaseType DB_TYPE = DatabaseType.Sqlite;
-string OLD_DB_CONNECTION_STRING = Path.Combine("data", "old.db");
-string NEW_DB_CONNECTION_STRING = Path.Combine("data", "new.db");
+string OLD_DB_CONNECTION_STRING = $"Data Source={Path.Combine("data", "old.db")}; Bind DateTime=False;";
+string NEW_DB_CONNECTION_STRING = $"Data Source={Path.Combine("data", "new.db")}; Bind DateTime=False;";
+string TEMP_DB_FILE_PATH = Path.Combine("data", "temp.db");
 
-// Setting this to 'true' will ensure the new database is not modified, so you can see if/how it works.
+// Setting this to 'true' will ensure the NEW database is not modified, so you can see if/how it works.
 // Tip: You can see all the modified data in the file 'temp.db'
 bool DRY_RUN = true; // args.Any(x => x == "--dry-run");
 
-// Setting this to 'true' will speed up the time it takes to merge the databases but may lead to inconsistent data
-bool SKIP_DUPLICATE_CHECK = true; // args.Any(x => x == "--skip-duplicate-check");
+// Setting this to 'true' will significantly speed up the time it takes to merge the databases but may lead to inconsistent data.
+// However, if this is set to 'true' and you get a 'UNIQUE constraint' error log, then you should set this to 'false' and try again.
+bool SKIP_DUPLICATE_CHECK = false; // args.Any(x => x == "--skip-duplicate-check");
 
 // Setting this to 'true' will create a mirror copy of the statistic tables in the
-// new database after all records have been processed.
-// This allows you to use your new database whilst keeping all the old statistics.
+// NEW database after all records have been processed.
+// This allows you to use your NEW database whilst keeping all the OLD database statistics.
 bool COPY_TO_NEW_DB = false; // args.Any(x => x == "--copy-to-new-db");
 
+// Schema version is populated by looking in the old DB schema_changes table
+// The version specified here is the assumed version if one is not found in the schema_changes table
+int schemaVersion = 49;
 
 Console.WriteLine($"Starting data merge{(DRY_RUN ? " (dry run)" : string.Empty)}");
-Console.WriteLine($" - OLD DB path: {Path.GetFullPath(OLD_DB_CONNECTION_STRING)}");
-Console.WriteLine($" - NEW DB path: {Path.GetFullPath(NEW_DB_CONNECTION_STRING)}");
+Console.WriteLine($" - OLD DB: {OLD_DB_CONNECTION_STRING}");
+Console.WriteLine($" - NEW DB: {NEW_DB_CONNECTION_STRING}");
 var stopwatch = Stopwatch.StartNew();
 
-var dbFactory = new OrmLiteConnectionFactory(OLD_DB_CONNECTION_STRING, GetProvider(DB_TYPE));
+var dbFactory = new OrmLiteConnectionFactory(TEMP_DB_FILE_PATH, GetProvider(DatabaseType.Sqlite));
 dbFactory.RegisterConnection("OldDb", OLD_DB_CONNECTION_STRING, GetProvider(DB_TYPE));
 dbFactory.RegisterConnection("NewDb", NEW_DB_CONNECTION_STRING, GetProvider(DB_TYPE));
-dbFactory.RegisterConnection("TempDb", Path.Combine("data", "temp.db"), GetProvider(DatabaseType.Sqlite));
 
+using (var tempDb = dbFactory.OpenDbConnection())
 using (var oldDb = dbFactory.OpenDbConnection("OldDb"))
 using (var newDb = dbFactory.OpenDbConnection("NewDb"))
-using (var tempDb = dbFactory.OpenDbConnection("TempDb"))
 {
+    if (!oldDb.TableExists<Statistic>())
+    {
+        Console.WriteLine("\n[ERROR] Cannot find 'statistics' table, is the OLD database corrupt or empty?");
+        goto finish;
+    }
+
+    if (!newDb.TableExists<Statistic>())
+    {
+        Console.WriteLine("\n[ERROR] Cannot find 'statistics' table, is the NEW database corrupt or empty?");
+        goto finish;
+    }
+
+    if (!oldDb.TableExists<StatisticShortTerm>())
+    {
+        Console.WriteLine("\n[ERROR] Cannot find 'statistics_short_term' table, is the OLD database corrupt or empty?");
+        goto finish;
+    }
+
+    if (!newDb.TableExists<StatisticShortTerm>())
+    {
+        Console.WriteLine("\n[ERROR] Cannot find 'statistics_short_term' table, is NEW database corrupt or empty?");
+        goto finish;
+    }
+
+    if (!oldDb.TableExists<StatisticMeta>())
+    {
+        Console.WriteLine("\n[ERROR] Cannot find 'statistics_meta' table, is the OLD database corrupt or empty?");
+        goto finish;
+    }
+
+    if (!newDb.TableExists<StatisticMeta>())
+    {
+        Console.WriteLine("\n[ERROR] Cannot find 'statistics_meta' table, is the NEW database corrupt or empty?");
+        goto finish;
+    }
+
+    if (oldDb.TableExists<SchemaChanges>())
+    {
+        var oldDbSchemaVersion = oldDb.Scalar<SchemaChanges, int>(x => Sql.Max(x.SchemaVersion));
+        if (oldDbSchemaVersion == 0)
+        {
+            Console.WriteLine($"\n[WARNING] Could not determine schema version, assuming version {schemaVersion}.");
+        }
+        else
+        {
+            Console.WriteLine($"\nDetected schema version {oldDbSchemaVersion}");
+            schemaVersion = oldDbSchemaVersion;
+        }
+
+        if (newDb.TableExists<SchemaChanges>())
+        {
+            var newDbSchemaVersion = newDb.Scalar<SchemaChanges, int>(x => Sql.Max(x.SchemaVersion));
+            if (newDbSchemaVersion == 0) newDbSchemaVersion = schemaVersion;
+            if (newDbSchemaVersion != schemaVersion)
+                Console.WriteLine("\n[WARNING] Schema version does not match between databases " +
+                    $"(OLD = {schemaVersion}, NEW = {newDbSchemaVersion}), merged data may be invalid.");
+        }
+        else
+        {
+            Console.WriteLine("\n[WARNING] Could not find schema_changes table in NEW database, " +
+                "assuming same schema version as the OLD database, merged data may be invalid.");
+        }
+    }
+    else
+    {
+        Console.WriteLine($"\n[WARNING] Could not find schema_changes table, assuming schema version {schemaVersion}.");
+    }
+
     var metadataMatches = new List<MetaMatch>();
 
     // 1. Match metadata records between the old and new database
@@ -64,8 +137,8 @@ using (var tempDb = dbFactory.OpenDbConnection("TempDb"))
 
     if (oldMetaRows.Count == 0)
     {
-        Console.WriteLine($"\nWARN: No statistic metadata in the old database!");
-        return;
+        Console.WriteLine("\n[ERROR] No data found in the statistics_meta table, is the OLD database corrupt or empty?");
+        goto finish;
     }
 
     int statisticIdHeaderLength = oldMetaRows.Max(x => x.StatisticId.Length) + 2;
@@ -89,8 +162,9 @@ using (var tempDb = dbFactory.OpenDbConnection("TempDb"))
             newRow != null && oldRow.HasSum ? "YES      " : "NO      ");
     }
 
-    Console.WriteLine($"\nStatistic metadata matches:");
-    var headerStr = string.Format($"|{{0,8}}|{{1,8}}|{{2,{statisticIdHeaderLength}}}|{{3,14}}|", "old id", "new id", "statistic_id", "recalculate?");
+    Console.WriteLine("\nStatistic metadata matches:");
+    var headerStr = string.Format($"|{{0,8}}|{{1,8}}|{{2,{statisticIdHeaderLength}}}|{{3,14}}|",
+        "old id", "new id", "statistic_id", "recalculate?");
     Console.WriteLine(headerStr);
     Console.WriteLine(new string('-', headerStr.Length));
     Console.WriteLine(matchesConsoleString + "\n");
@@ -99,234 +173,287 @@ using (var tempDb = dbFactory.OpenDbConnection("TempDb"))
     var metaMatchesToRemap = metadataMatches.Where(x => x.NewId.HasValue).ToList();
     if (metaMatchesToRemap.Count > 0)
     {
-        // 2. Populate the old 'statistics' table with data from the new database and recalculate the 'sum' column if required
-        Console.WriteLine($"Processing 'statistics' table...\n");
-
-        tempDb.DropAndCreateTable<Statistic>();
-
-        List<Statistic> newStatisticRows = new();
-        int duplicateStatisticRowCount = 0;
-        foreach (var metaMatch in metaMatchesToRemap)
+        void Populate<TStatistic, TStatisticShortTerm>()
+            where TStatistic : Statistic
+            where TStatisticShortTerm : Statistic
         {
-            Statistic? oldDbLastRecordedStatistic = null;
-            var newStatisticQuery = newDb.From<Statistic>()
-                .Where(x => x.MetadataId == metaMatch.NewId);
+            // 2. Populate the old 'statistics' table with data from the new database and recalculate the 'sum' column if required
+            Console.WriteLine("Processing 'statistics' table...\n");
 
-            if (metaMatch.HasSum)
+            tempDb.DropAndCreateTable<TStatistic>();
+
+            List<TStatistic> newStatisticRows = new();
+            int duplicateStatisticRowCount = 0;
+            foreach (var metaMatch in metaMatchesToRemap)
             {
-                oldDbLastRecordedStatistic = oldDb.Select(oldDb.From<Statistic>()
-                    .Where(x => x.MetadataId == metaMatch.OldId)
-                    .OrderByDescending(x => x.Id).Limit(1))
-                    .FirstOrDefault();
-                if (oldDbLastRecordedStatistic == null) continue;
+                TStatistic? oldDbLastRecordedStatistic = null;
+                var newStatisticQuery = newDb.From<TStatistic>()
+                    .Where(x => x.MetadataId == metaMatch.NewId);
 
-                // Ensure only new data is added which doesnt conflict with the data
-                if (oldDbLastRecordedStatistic.CreatedTs.HasValue)
+                if (metaMatch.HasSum)
                 {
-                    var lastDate = DateTimeExtensions.FromUnixTime(oldDbLastRecordedStatistic.CreatedTs.Value);
-                    newStatisticQuery = newStatisticQuery
-                        .Where(x => x.CreatedTs > oldDbLastRecordedStatistic.CreatedTs || x.Created > lastDate);
-                }
-                else if (oldDbLastRecordedStatistic.Created.HasValue)
-                {
-                    var lastDate = Convert.ToDouble(oldDbLastRecordedStatistic.Created.Value.ToUnixTimeMs());
-                    newStatisticQuery = newStatisticQuery
-                        .Where(newStatistic => newStatistic.Created > oldDbLastRecordedStatistic.Created || newStatistic.CreatedTs > lastDate);
-                }
-                else
-                {
-                    Console.WriteLine($"WARN: Cannot determine last recorded statistic for entity '{metaMatch.EntityId}', skipping insert!");
-                    continue;
-                }
-            }
+                    oldDbLastRecordedStatistic = oldDb.Select(oldDb.From<TStatistic>()
+                        .Where(x => x.MetadataId == metaMatch.OldId)
+                        .OrderByDescending(x => x.Id).Limit(1))
+                        .FirstOrDefault();
+                    if (oldDbLastRecordedStatistic == null) continue;
 
-            var tempStatisticRows = newDb.Select(newStatisticQuery).ToList();
-
-            if (tempStatisticRows.Count > 0)
-            {
-                foreach (var row in tempStatisticRows)
-                {
-                    // Skip duplicate records
-                    // todo: how do we check potentially millions of records for a match efficiently?
-                    if (!SKIP_DUPLICATE_CHECK)
+                    // Ensure only new data is added which doesnt conflict with the data
+                    if (oldDbLastRecordedStatistic.CreatedTs.HasValue)
                     {
-                        if (row.StartTs.HasValue)
+                        var lastDate = DateTimeExtensions.FromUnixTime(oldDbLastRecordedStatistic.CreatedTs.Value);
+                        newStatisticQuery = newStatisticQuery
+                            .Where(x =>
+                                (x.CreatedTs.HasValue && x.CreatedTs > oldDbLastRecordedStatistic.CreatedTs) ||
+                                (x.Created.HasValue && x.Created > lastDate));
+                    }
+                    else if (oldDbLastRecordedStatistic.Created.HasValue)
+                    {
+                        var lastDate = Convert.ToDouble(oldDbLastRecordedStatistic.Created.Value.ToUnixTimeMs());
+                        newStatisticQuery = newStatisticQuery
+                            .Where(x =>
+                                    (x.Created.HasValue && x.Created > oldDbLastRecordedStatistic.Created) ||
+                                    (x.CreatedTs.HasValue && x.CreatedTs > lastDate));
+                    }
+                    else
+                    {
+                        Console.WriteLine("[WARNING] Cannot determine last recorded statistic for entity " +
+                            $"'{metaMatch.EntityId}', skipping insert!");
+                        continue;
+                    }
+                }
+
+                var tempStatisticRows = newDb.Select(newStatisticQuery).ToList();
+
+                if (tempStatisticRows.Count > 0)
+                {
+                    foreach (var row in tempStatisticRows)
+                    {
+                        // Skip duplicate records
+                        // todo: how do we check potentially millions of records for a match efficiently?
+                        if (!SKIP_DUPLICATE_CHECK)
                         {
-                            //if (oldStatisticRows.Any(x => x.StartTs == row.StartTs))
-                            if (oldDb.Count<Statistic>(x => x.MetadataId == metaMatch.OldId && x.StartTs == row.StartTs) > 0)
+                            if (row.StartTs.HasValue)
                             {
-                                duplicateStatisticRowCount++;
+                                //if (oldStatisticRows.Any(x => x.StartTs == row.StartTs))
+                                if (oldDb.Count<TStatistic>(x => x.MetadataId == metaMatch.OldId && x.StartTs == row.StartTs) > 0)
+                                {
+                                    duplicateStatisticRowCount++;
+                                    continue;
+                                }
+                            }
+                            else if (row.Start.HasValue)
+                            {
+                                //if (oldStatisticRows.Any(x => x.Start == row.Start))
+                                if (oldDb.Count<TStatistic>(x => x.MetadataId == metaMatch.OldId && x.Start == row.Start) > 0)
+                                {
+                                    duplicateStatisticRowCount++;
+                                    continue;
+                                }
+                            }
+                            else
+                            {
                                 continue;
                             }
                         }
-                        else if (row.Start.HasValue)
-                        {
-                            //if (oldStatisticRows.Any(x => x.Start == row.Start))
-                            if (oldDb.Count<Statistic>(x => x.MetadataId == metaMatch.OldId && x.Start == row.Start) > 0)
-                            {
-                                duplicateStatisticRowCount++;
-                                continue;
-                            }
-                        }
-                        else
-                        {
-                            continue;
-                        }
+
+                        row.MetadataId = metaMatch.OldId;
+
+                        if (oldDbLastRecordedStatistic != null)
+                            row.Sum += oldDbLastRecordedStatistic.Sum;
+                    
+                        newStatisticRows.Add(row);
                     }
 
-                    row.MetadataId = metaMatch.OldId;
-
-                    if (oldDbLastRecordedStatistic != null)
-                        row.Sum += oldDbLastRecordedStatistic.Sum;
-                
-                    newStatisticRows.Add(row);
-                }
-
-                Console.WriteLine($"{newStatisticRows.Count}{(metaMatch.HasSum ? " recalculated" : string.Empty)} rows to insert for entity '{metaMatch.EntityId}'");
-            }
-        }
-
-        if (newStatisticRows.Count > 0)
-        {
-            newStatisticRows = newStatisticRows.OrderBy(x => x.Id).ToList();
-
-            if (!DRY_RUN) oldDb.InsertAll(newStatisticRows);
-            tempDb.InsertAll(newStatisticRows);
-
-            Console.WriteLine($"\n{newStatisticRows.Count} rows inserted in 'statistics' table");
-        }
-
-        if (duplicateStatisticRowCount > 0)
-        {
-            Console.WriteLine($"{duplicateStatisticRowCount} duplicate rows found in 'statistics' table");
-        }
-        Console.WriteLine($"Elapsed time (so far) {stopwatch.Elapsed.Humanize()}\n");
-        // 2. END
-
-        // 3. Populate the old 'statistics_short_term' table with data from the new database and recalculate the 'sum' column if required
-        Console.WriteLine($"\nProcessing 'statistics_short_term' table...\n");
-
-        tempDb.DropAndCreateTable<StatisticShortTerm>();
-
-        List<StatisticShortTerm> newStatisticShortTermRows = new();
-        int duplicateStatisticShortTermRowCount = 0;
-        foreach (var metaMatch in metaMatchesToRemap)
-        {
-            StatisticShortTerm? oldDbLastRecordedStatistic = null;
-            var newStatisticQuery = newDb.From<StatisticShortTerm>()
-                .Where(x => x.MetadataId == metaMatch.NewId);
-
-            if (metaMatch.HasSum)
-            {
-                oldDbLastRecordedStatistic = oldDb.Select(oldDb.From<StatisticShortTerm>()
-                    .Where(x => x.MetadataId == metaMatch.OldId)
-                    .OrderByDescending(x => x.Id).Limit(1))
-                    .FirstOrDefault();
-                if (oldDbLastRecordedStatistic == null) continue;
-
-                // Ensure only new data is added which doesnt conflict with the data
-                if (oldDbLastRecordedStatistic.CreatedTs.HasValue)
-                {
-                    var lastDate = DateTimeExtensions.FromUnixTime(oldDbLastRecordedStatistic.CreatedTs.Value);
-                    newStatisticQuery = newStatisticQuery
-                        .Where(x => x.CreatedTs > oldDbLastRecordedStatistic.CreatedTs || x.Created > lastDate);
-                }
-                else if (oldDbLastRecordedStatistic.Created.HasValue)
-                {
-                    var lastDate = Convert.ToDouble(oldDbLastRecordedStatistic.Created.Value.ToUnixTimeMs());
-                    newStatisticQuery = newStatisticQuery
-                        .Where(newStatistic => newStatistic.Created > oldDbLastRecordedStatistic.Created || newStatistic.CreatedTs > lastDate);
-                }
-                else
-                {
-                    Console.WriteLine($"WARN: Cannot determine last recorded statistic for entity '{metaMatch.EntityId}', skipping insert!");
-                    continue;
+                    Console.WriteLine($"{tempStatisticRows.Count}{(metaMatch.HasSum ? " recalculated" : string.Empty)} " +
+                        $"rows to insert for entity '{metaMatch.EntityId}'");
                 }
             }
 
-            var tempStatisticRows = newDb.Select(newStatisticQuery).ToList();
+            Console.WriteLine();
 
-            if (tempStatisticRows.Count > 0)
+            if (newStatisticRows.Count > 0)
             {
-                foreach (var row in tempStatisticRows)
+                newStatisticRows = newStatisticRows.OrderBy(x => x.Id).ToList();
+
+                if (!DRY_RUN) oldDb.InsertAll(newStatisticRows);
+                tempDb.InsertAll(newStatisticRows);
+
+                Console.WriteLine($"{newStatisticRows.Count} rows inserted in 'statistics' table");
+            }
+
+            if (duplicateStatisticRowCount > 0)
+            {
+                Console.Write($"{duplicateStatisticRowCount} duplicate rows found in 'statistics' table");
+                Console.WriteLine(newStatisticRows.Count > 0 ? "" : " (no rows inserted)");
+            }
+
+            Console.WriteLine($"\nElapsed time (so far) {stopwatch.Elapsed.Humanize()}\n");
+            // 2. END
+
+            // 3. Populate the old 'statistics_short_term' table with data from the new database and recalculate the 'sum' column if required
+            Console.WriteLine("\nProcessing 'statistics_short_term' table...\n");
+
+            tempDb.DropAndCreateTable<TStatisticShortTerm>();
+
+            List<TStatisticShortTerm> newStatisticShortTermRows = new();
+            int duplicateStatisticShortTermRowCount = 0;
+            foreach (var metaMatch in metaMatchesToRemap)
+            {
+                TStatisticShortTerm? oldDbLastRecordedStatistic = null;
+                var newStatisticQuery = newDb.From<TStatisticShortTerm>()
+                    .Where(x => x.MetadataId == metaMatch.NewId);
+
+                if (metaMatch.HasSum)
                 {
-                    // Skip duplicate records
-                    if (!SKIP_DUPLICATE_CHECK)
+                    oldDbLastRecordedStatistic = oldDb.Select(oldDb.From<TStatisticShortTerm>()
+                        .Where(x => x.MetadataId == metaMatch.OldId)
+                        .OrderByDescending(x => x.Id).Limit(1))
+                        .FirstOrDefault();
+                    if (oldDbLastRecordedStatistic == null) continue;
+
+                    // Ensure only new data is added which doesnt conflict with the data
+                    if (oldDbLastRecordedStatistic.CreatedTs.HasValue)
                     {
-                        if (row.StartTs.HasValue)
+                        var lastDate = DateTimeExtensions.FromUnixTime(oldDbLastRecordedStatistic.CreatedTs.Value);
+                        newStatisticQuery = newStatisticQuery
+                            .Where(x =>
+                                (x.CreatedTs.HasValue && x.CreatedTs > oldDbLastRecordedStatistic.CreatedTs) ||
+                                (x.Created.HasValue && x.Created > lastDate));
+                    }
+                    else if (oldDbLastRecordedStatistic.Created.HasValue)
+                    {
+                        var lastDate = Convert.ToDouble(oldDbLastRecordedStatistic.Created.Value.ToUnixTimeMs());
+                        newStatisticQuery = newStatisticQuery
+                            .Where(x =>
+                                    (x.Created.HasValue && x.Created > oldDbLastRecordedStatistic.Created) ||
+                                    (x.CreatedTs.HasValue && x.CreatedTs > lastDate));
+                    }
+                    else
+                    {
+                        Console.WriteLine("[WARNING] Cannot determine last recorded statistic for entity " +
+                            $"'{metaMatch.EntityId}', skipping insert!");
+                        continue;
+                    }
+                }
+
+                var tempStatisticRows = newDb.Select(newStatisticQuery).ToList();
+
+                if (tempStatisticRows.Count > 0)
+                {
+                    foreach (var row in tempStatisticRows)
+                    {
+                        // Skip duplicate records
+                        if (!SKIP_DUPLICATE_CHECK)
                         {
-                            if (oldDb.Count<StatisticShortTerm>(x => x.MetadataId == metaMatch.OldId && x.StartTs == row.StartTs) > 0)
+                            if (row.StartTs.HasValue)
                             {
-                                duplicateStatisticRowCount++;
+                                if (oldDb.Count<TStatisticShortTerm>(x =>
+                                    x.MetadataId == metaMatch.OldId && x.StartTs == row.StartTs) > 0)
+                                {
+                                    duplicateStatisticShortTermRowCount++;
+                                    continue;
+                                }
+                            }
+                            else if (row.Start.HasValue)
+                            {
+                                if (oldDb.Count<TStatisticShortTerm>(x =>
+                                    x.MetadataId == metaMatch.OldId && x.Start == row.Start) > 0)
+                                {
+                                    duplicateStatisticShortTermRowCount++;
+                                    continue;
+                                }
+                            }
+                            else
+                            {
                                 continue;
                             }
                         }
-                        else if (row.Start.HasValue)
-                        {
-                            if (oldDb.Count<StatisticShortTerm>(x => x.MetadataId == metaMatch.OldId && x.Start == row.Start) > 0)
-                            {
-                                duplicateStatisticRowCount++;
-                                continue;
-                            }
-                        }
-                        else
-                        {
-                            continue;
-                        }
+
+                        row.MetadataId = metaMatch.OldId;
+
+                        if (oldDbLastRecordedStatistic != null)
+                            row.Sum += oldDbLastRecordedStatistic.Sum;
+                    
+                        newStatisticShortTermRows.Add(row);
                     }
 
-                    row.MetadataId = metaMatch.OldId;
-
-                    if (oldDbLastRecordedStatistic != null)
-                        row.Sum += oldDbLastRecordedStatistic.Sum;
-                
-                    newStatisticShortTermRows.Add(row);
+                    Console.WriteLine($"{tempStatisticRows.Count}{(metaMatch.HasSum ? " recalculated" : string.Empty)} " +
+                        $"rows to insert for entity '{metaMatch.EntityId}'");
                 }
-
-                Console.WriteLine($"{newStatisticShortTermRows.Count}{(metaMatch.HasSum ? " recalculated" : string.Empty)} rows to insert for entity '{metaMatch.EntityId}'");
             }
+
+            Console.WriteLine();
+
+            if (newStatisticShortTermRows.Count > 0)
+            {
+                newStatisticShortTermRows = newStatisticShortTermRows.OrderBy(x => x.Id).ToList();
+
+                if (!DRY_RUN) oldDb.InsertAll(newStatisticShortTermRows);
+                tempDb.InsertAll(newStatisticShortTermRows);
+
+                Console.WriteLine($"{newStatisticShortTermRows.Count} rows inserted in 'statistics_short_term' table");
+            }
+
+            if (duplicateStatisticShortTermRowCount > 0)
+            {
+                Console.Write($"{duplicateStatisticShortTermRowCount} " +
+                    "duplicate rows found in 'statistics_short_term' table");
+                Console.WriteLine(newStatisticShortTermRows.Count > 0 ? "" : " (no rows inserted)");
+            }
+
+            Console.WriteLine($"\nElapsed time (so far) {stopwatch.Elapsed.Humanize()}\n");
+            // 3. END
         }
 
-        if (newStatisticShortTermRows.Count > 0)
-        {
-            newStatisticShortTermRows = newStatisticShortTermRows.OrderBy(x => x.Id).ToList();
-
-            if (!DRY_RUN) oldDb.InsertAll(newStatisticShortTermRows);
-            tempDb.InsertAll(newStatisticShortTermRows);
-
-            Console.WriteLine($"\n{newStatisticShortTermRows.Count} rows inserted in 'statistics_short_term' table");
-        }
-
-        if (duplicateStatisticShortTermRowCount > 0)
-        {
-            Console.WriteLine($"{duplicateStatisticShortTermRowCount} duplicate rows found in 'statistics_short_term' table");
-        }
-        Console.WriteLine($"Elapsed time (so far) {stopwatch.Elapsed.Humanize()}\n");
-        // 3. END
+        if (schemaVersion >= 49)
+            Populate<Statistic_V49, StatisticShortTerm_V49>();
+        else
+            Populate<Statistic, StatisticShortTerm>();
     }
     else
     {
-        Console.WriteLine($"\nWARN: No statistic metadata matches found\n");
+        Console.WriteLine("\n[WARNING] No statistic metadata matches found, " +
+            "are you comparing data from the same Home Assistant instance?");
     }
 
     // 4. Copy newer 'statistic_runs' entries from the new database to the old database
-    var lastStatisticRun = oldDb.Select(oldDb.From<StatisticRun>()
-        .OrderByDescending(x => x.Start).Limit(1))
-        .FirstOrDefault();
-
-    var statisticRunQuery = newDb.From<StatisticRun>();
-    if (lastStatisticRun != null)
+    if (oldDb.TableExists<StatisticRun>())
     {
-        statisticRunQuery = statisticRunQuery.Where(x => x.Start > lastStatisticRun.Start);
+        var lastStatisticRun = oldDb.Select(oldDb.From<StatisticRun>()
+            .OrderByDescending(x => x.Start).Limit(1))
+            .FirstOrDefault();
+
+        var statisticRunQuery = newDb.From<StatisticRun>();
+        if (lastStatisticRun != null)
+        {
+            statisticRunQuery = statisticRunQuery.Where(x => x.Start > lastStatisticRun.Start);
+        }
+
+        var statisticRunsToCopy = newDb.Select(statisticRunQuery);
+        if (statisticRunsToCopy.Count > 0)
+        {
+            // Edge-case where SQL lexical comparison doesn't work because of fractional seconds in DB
+            // but query parameter has no fractional part.
+            if (statisticRunsToCopy.First().Start == lastStatisticRun?.Start)
+            {
+                statisticRunsToCopy.RemoveAt(0);
+            }
+
+            if (statisticRunsToCopy.Count > 0)
+            {
+                tempDb.DropAndCreateTable<StatisticRun>();
+                if (!DRY_RUN) oldDb.InsertAll(statisticRunsToCopy);
+                tempDb.InsertAll(statisticRunsToCopy);
+                Console.WriteLine($"\nCopied {statisticRunsToCopy.Count} rows in to 'statistics_runs' table " +
+                    $"(elapsed time so far {stopwatch.Elapsed.Humanize()})\n");
+            }
+        }
     }
-
-    var statisticRunsToCopy = newDb.Select(statisticRunQuery);
-    if (statisticRunsToCopy.Count > 0)
+    else
     {
-        tempDb.DropAndCreateTable<StatisticRun>();
-        if (!DRY_RUN) oldDb.InsertAll(statisticRunsToCopy);
-        tempDb.InsertAll(statisticRunsToCopy);
-        Console.WriteLine($"\nCopied {statisticRunsToCopy.Count} rows in to 'statistics_runs' table (elapsed time so far {stopwatch.Elapsed.Humanize()})\n");
+        Console.WriteLine("\n[WARNING] Could not find 'statistics_runs' table in the OLD database, " +
+            "skipping merge from new database.");
     }
     // 4. END
 
@@ -336,44 +463,67 @@ using (var tempDb = dbFactory.OpenDbConnection("TempDb"))
     // 6. (optionally) Copy data back to the new database, syncronizing both databases.
     if (COPY_TO_NEW_DB)
     {
-        Console.WriteLine($"\nCopying statistic data from the old database to the new database...\n");
+        Console.WriteLine("\nCopying statistic data from the OLD database to the NEW database...\n");
+        
         using (var scope = new TransactionScope(TransactionScopeOption.RequiresNew, TimeSpan.FromMinutes(3)))
         {
-            if (!DRY_RUN) newDb.DeleteAll<StatisticMeta>();
-            Console.WriteLine($"[NewDB] Deleted all 'statistics_meta' rows");
-            if (!DRY_RUN) newDb.DeleteAll<Statistic>();
-            Console.WriteLine($"[NewDB] Deleted all 'statistics' rows");
-            if (!DRY_RUN) newDb.DeleteAll<StatisticShortTerm>();
-            Console.WriteLine($"[NewDB] Deleted all 'statistics_short_term' rows");
-            if (!DRY_RUN) newDb.DeleteAll<StatisticRun>();
-            Console.WriteLine($"[NewDB] Deleted all 'statistics_runs' rows");
+            void Copy<TStatistic, TStatisticShortTerm, TStatisticMeta>()
+                where TStatistic : Statistic
+                where TStatisticShortTerm : Statistic
+                where TStatisticMeta : StatisticMeta
+            {
+                if (!DRY_RUN) newDb.DeleteAll<TStatisticMeta>();
+                Console.WriteLine($"[NewDB] Deleted all 'statistics_meta' rows");
+                if (!DRY_RUN) newDb.DeleteAll<TStatistic>();
+                Console.WriteLine($"[NewDB] Deleted all 'statistics' rows");
+                if (!DRY_RUN) newDb.DeleteAll<TStatisticShortTerm>();
+                Console.WriteLine($"[NewDB] Deleted all 'statistics_short_term' rows");
+                if (!DRY_RUN) newDb.DeleteAll<StatisticRun>();
+                Console.WriteLine($"[NewDB] Deleted all 'statistics_runs' rows");
 
-            var allStatisticMetaRows = oldDb.Select<StatisticMeta>();
-            var allStatisticRows = oldDb.Select<Statistic>();
-            var allStatisticShortTermRows = oldDb.Select<StatisticShortTerm>();
-            var allStatisticRunRows = oldDb.Select<StatisticRun>();
+                var allStatisticMetaRows = oldDb.Select<TStatisticMeta>();
+                var allStatisticRows = oldDb.Select<TStatistic>();
+                var allStatisticShortTermRows = oldDb.Select<TStatisticShortTerm>();
+                var allStatisticRunRows = oldDb.Select<StatisticRun>();
 
-            if (!DRY_RUN) newDb.InsertAll(allStatisticMetaRows);
-            Console.WriteLine($"[NewDB] Inserted {allStatisticMetaRows.Count} rows in to 'statistics_meta' table");
-            if (!DRY_RUN) newDb.InsertAll(allStatisticRows);
-            Console.WriteLine($"[NewDB] Inserted {allStatisticRows.Count} rows in to 'statistics' table");
-            if (!DRY_RUN) newDb.InsertAll(allStatisticShortTermRows);
-            Console.WriteLine($"[NewDB] Inserted {allStatisticShortTermRows.Count} rows in to 'statistics_short_term' table");
-            if (!DRY_RUN) newDb.InsertAll(allStatisticRunRows);
-            Console.WriteLine($"[NewDB] Inserted {allStatisticRunRows.Count} rows in to 'statistics_runs' table (elapsed time so far {stopwatch.Elapsed.Humanize()})");
+                if (!DRY_RUN) newDb.InsertAll(allStatisticMetaRows);
+                Console.WriteLine($"[NewDB] Inserted {allStatisticMetaRows.Count} rows in to 'statistics_meta' table");
+                if (!DRY_RUN) newDb.InsertAll(allStatisticRows);
+                Console.WriteLine($"[NewDB] Inserted {allStatisticRows.Count} rows in to 'statistics' table");
+                if (!DRY_RUN) newDb.InsertAll(allStatisticShortTermRows);
+                Console.WriteLine($"[NewDB] Inserted {allStatisticShortTermRows.Count} rows in to 'statistics_short_term' table");
+                if (!DRY_RUN) newDb.InsertAll(allStatisticRunRows);
+                Console.WriteLine($"[NewDB] Inserted {allStatisticRunRows.Count} rows in to 'statistics_runs' table " +
+                    $"(elapsed time so far {stopwatch.Elapsed.Humanize()})");
 
-            scope.Complete();
+                scope.Complete();
+            }
+
+            if (schemaVersion >= 49)
+                Copy<Statistic_V49, StatisticShortTerm_V49, StatisticMeta_V49>();
+            else
+                Copy<Statistic, StatisticShortTerm, StatisticMeta>();
         }
-        stopwatch.Stop();
-        Console.WriteLine($"\nFinished copying statistic data in {stopwatch.Elapsed.Humanize()}!\n");
     }
     // 6. END
+finish:
+    stopwatch.Stop();
+    Console.WriteLine($"\nFinished merging statistic data in {stopwatch.Elapsed.Humanize()}\n");
+}
+
+if (File.Exists(TEMP_DB_FILE_PATH))
+{
+    if (new FileInfo(TEMP_DB_FILE_PATH).Length == 0)
+    {
+        Console.WriteLine("Nothing written to temp.db - file deleted.\n");
+        File.Delete(TEMP_DB_FILE_PATH);
+    }
 }
 
 public struct MetaMatch
 {
-    public int OldId;
-    public int? NewId;
+    public long OldId;
+    public long? NewId;
     public string EntityId;
     public bool HasSum;
 }
@@ -390,23 +540,32 @@ public class StatisticRun
 {
     [PrimaryKey]
     [AutoIncrement]
-    [Alias("id")] public int Id { get; set; }
+    [Alias("run_id")] public long Id { get; set; }
     [Alias("start")] public DateTime Start { get; set; }
 }
+
 
 [Alias("statistics_meta")]
 public class StatisticMeta
 {
     [PrimaryKey]
     [AutoIncrement]
-    [Alias("id")] public int Id { get; set; }
+    [Alias("id")] public long Id { get; set; }
     [Alias("statistic_id")] public string StatisticId { get; set; } = "";
     [Alias("source")] public string Source { get; set; } = "";
     [Alias("unit_of_measurement")] public string UnitOfMeasurement { get; set; } = "";
     [Alias("name")] public string Name { get; set; } = "";
-    [Alias("mean_type")] public short MeanType { get; set; }
     [Alias("has_mean")] public bool HasMean { get; set; }
     [Alias("has_sum")] public bool HasSum { get; set; }
+}
+
+// see: https://github.com/home-assistant/core/blob/3f49877ff1529d6c6a1e48dff2bff0ca09992c71/homeassistant/components/recorder/migration.py#L2021-L2048
+[Alias("statistics_meta")]
+public class StatisticMeta_V49 : StatisticMeta
+{
+    [Alias("mean_type")]
+    [Default(0)]
+    public short MeanType { get; set; }
 }
 
 [Alias("statistics")]
@@ -414,8 +573,8 @@ public class Statistic
 {
     [PrimaryKey]
     [AutoIncrement]
-    [Alias("id")] public int Id { get; set; }
-    [Alias("metadata_id")] public int MetadataId { get; set; }
+    [Alias("id")] public long Id { get; set; }
+    [Alias("metadata_id")] public long MetadataId { get; set; }
     [Alias("created")] public DateTime? Created { get; set; }
     [Alias("created_ts")] public double? CreatedTs { get; set; }
     [Alias("start")] public DateTime? Start { get; set; }
@@ -431,3 +590,24 @@ public class Statistic
 
 [Alias("statistics_short_term")]
 public class StatisticShortTerm : Statistic { }
+
+// see: https://github.com/home-assistant/core/blob/3f49877ff1529d6c6a1e48dff2bff0ca09992c71/homeassistant/components/recorder/migration.py#L2021-L2048
+[Alias("statistics")]
+public class Statistic_V49 : Statistic
+{
+    [Alias("mean_weight")] public double? MeanWeight { get; set; }
+}
+
+// see: https://github.com/home-assistant/core/blob/3f49877ff1529d6c6a1e48dff2bff0ca09992c71/homeassistant/components/recorder/migration.py#L2021-L2048
+[Alias("statistics_short_term")]
+public class StatisticShortTerm_V49 : Statistic_V49 {}
+
+[Alias("schema_changes")]
+public class SchemaChanges
+{
+    [PrimaryKey]
+    [Alias("change_id")]
+    public long ChangeId { get; set; }
+    [Alias("schema_version")] public int SchemaVersion { get; set; }
+    [Alias("changed")] public DateTime Changed { get; set; }
+}
